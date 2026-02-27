@@ -45,7 +45,7 @@ YouTubeの「登録チャンネル」を取得するには、自身のYouTubeア
 
 ```bash
 git clone <repository-url>
-cd channel-edit.start-line-system.com
+cd channel-edit-app
 ```
 
 ### 2. バックエンドのセットアップ
