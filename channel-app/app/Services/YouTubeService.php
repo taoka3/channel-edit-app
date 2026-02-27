@@ -11,26 +11,21 @@ use Illuminate\Support\Facades\Log;
 class YouTubeService
 {
     /**
+     * 登録チャンネルを1ページ分(最大50件)同期する
+     *
      * @param User $user
-     * @return int
+     * @param string|null $pageToken
+     * @return array ['synced' => int, 'nextPageToken' => string|null]
      * @throws \Exception
      */
-    public function syncUserChannels(User $user): int
+    public function syncUserChannelsPage(User $user, ?string $pageToken = null): array
     {
-        // 実際にはOAuth連携などでAccessTokenを取得、またはAPI Keyを利用。
-        // MVPでは設定されたAPIキーまたは固定リストからチャンネル一覧を取得する想定、
-        // あるいは $user->access_token を用いて subsciptions API を叩く実装をします。
-
         if (!$user->access_token) {
             throw new \Exception("YouTubeへのアクセス権がありません（Token未設定）。");
         }
 
-        // タイムアウト対策として実行時間を延長 (可能であれば)
-        set_time_limit(300);
-
-        $channelsFetched = 0;
-        $pageToken = null;
         $isApiKey = str_starts_with($user->access_token, 'AIza');
+        $referer = config('app.url');
 
         $params = [
             'part' => 'snippet',
@@ -39,30 +34,34 @@ class YouTubeService
         ];
 
         if ($isApiKey) {
-            // APIキーの場合、mine=trueはエラーになります。公開されている特定のチャンネルIDの登録チャンネルしか取得できません。
             $myChannelId = env('YOUTUBE_MY_CHANNEL_ID');
             if (!$myChannelId) {
-                throw new \Exception("APIキーを使用する場合、サブスクリプション(登録チャンネル)を取得するには .env に YOUTUBE_MY_CHANNEL_ID を設定し、かつYouTubeの設定で登録チャンネルを公開にしている必要があります。OAuthトークンであればマイチャンネルを直接取得可能です。");
+                throw new \Exception("APIキーを使用する場合、サブスクリプション(登録チャンネル)を取得するには .env に YOUTUBE_MY_CHANNEL_ID を設定し、かつYouTubeの設定で登録チャンネルを公開にしている必要があります。");
             }
             $params['channelId'] = $myChannelId;
             $params['key'] = $user->access_token;
-            $response = Http::timeout(10)->get('https://www.googleapis.com/youtube/v3/subscriptions', $params);
+            $response = Http::withHeaders(['Referer' => $referer])
+                ->timeout(30)
+                ->get('https://www.googleapis.com/youtube/v3/subscriptions', $params);
         } else {
-            // OAuth 2.0 アクセストークンの場合
             $params['mine'] = 'true';
             $response = Http::withToken($user->access_token)
-                ->timeout(10)
+                ->withHeaders(['Referer' => $referer])
+                ->timeout(30)
                 ->get('https://www.googleapis.com/youtube/v3/subscriptions', $params);
         }
 
         if ($response->failed()) {
-            Log::error('YouTube API Error (subscriptions): ' . $response->body());
+            Log::error("User {$user->id}: YouTube API Error (subscriptions): " . $response->body());
             throw new \Exception("YouTube APIの取得に失敗しました: " . $response->json('error.message', ''));
         }
 
         $data = $response->json();
         $items = $data['items'] ?? [];
+        $nextPageToken = $data['nextPageToken'] ?? null;
+        $totalResults = $data['pageInfo']['totalResults'] ?? 'unknown';
 
+        $syncedCount = 0;
         $channelIds = [];
         $channelDetailsMap = [];
 
@@ -81,7 +80,6 @@ class YouTubeService
         }
 
         if (!empty($channelIds)) {
-            // 各チャンネルの統計情報と最新動画を【一括】取得
             $bulkData = $this->fetchBulkChannelDetails($channelIds, $user->access_token);
 
             foreach ($channelIds as $id) {
@@ -106,19 +104,38 @@ class YouTubeService
                     ]
                 );
 
-                $channelsFetched++;
+                $syncedCount++;
             }
         }
 
-        return $channelsFetched;
+        return [
+            'synced' => $syncedCount,
+            'nextPageToken' => $nextPageToken,
+            'totalResults' => $totalResults
+        ];
+    }
+
+    /**
+     * @param User $user
+     * @return int
+     * @throws \Exception
+     * @deprecated ジョブ分割方式（syncUserChannelsPage）の使用を推奨します
+     */
+    public function syncUserChannels(User $user): int
+    {
+        $totalSynced = 0;
+        $pageToken = null;
+        do {
+            $result = $this->syncUserChannelsPage($user, $pageToken);
+            $totalSynced += $result['synced'];
+            $pageToken = $result['nextPageToken'];
+        } while ($pageToken);
+
+        return $totalSynced;
     }
 
     /**
      * 複数チャンネルの統計と最新動画を一括・並列で取得して返す
-     *
-     * @param array $channelIds
-     * @param string $token
-     * @return array
      */
     private function fetchBulkChannelDetails(array $channelIds, string $token): array
     {
@@ -129,13 +146,17 @@ class YouTubeService
             'maxResults' => 50,
         ];
 
-        // 1回のリクエストで最大50件のチャンネル統計を一括取得する
+        $referer = config('app.url');
+
         if ($isApiKey) {
             $params['key'] = $token;
-            $channelResponse = Http::timeout(10)->get('https://www.googleapis.com/youtube/v3/channels', $params);
+            $channelResponse = Http::withHeaders(['Referer' => $referer])
+                ->timeout(30)
+                ->get('https://www.googleapis.com/youtube/v3/channels', $params);
         } else {
             $channelResponse = Http::withToken($token)
-                ->timeout(10)
+                ->withHeaders(['Referer' => $referer])
+                ->timeout(30)
                 ->get('https://www.googleapis.com/youtube/v3/channels', $params);
         }
 
@@ -153,10 +174,9 @@ class YouTubeService
                 $results[$chId] = [
                     'subscriber_count' => $stat['subscriberCount'] ?? 0,
                     'video_count' => $stat['videoCount'] ?? 0,
-                    'last_video_at' => null, // 後で並列取得
+                    'last_video_at' => null,
                 ];
 
-                // 動画一覧用プレイリストID
                 $uploadsPlaylistId = $item['contentDetails']['relatedPlaylists']['uploads'] ?? null;
                 if ($uploadsPlaylistId) {
                     $playlistMap[$chId] = $uploadsPlaylistId;
@@ -164,9 +184,8 @@ class YouTubeService
             }
         }
 
-        // プレイリストIDを元に最新動画を並列(非同期)で取得 (Http::poolを利用)
         if (!empty($playlistMap)) {
-            $responses = Http::pool(function (\Illuminate\Http\Client\Pool $pool) use ($playlistMap, $isApiKey, $token) {
+            $responses = Http::pool(function (\Illuminate\Http\Client\Pool $pool) use ($playlistMap, $isApiKey, $token, $referer) {
                 $reqs = [];
                 foreach ($playlistMap as $chId => $playlistId) {
                     $pParams = [
@@ -177,15 +196,21 @@ class YouTubeService
 
                     if ($isApiKey) {
                         $pParams['key'] = $token;
-                        $reqs[] = $pool->as($chId)->timeout(10)->get('https://www.googleapis.com/youtube/v3/playlistItems', $pParams);
+                        $reqs[] = $pool->as($chId)
+                            ->withHeaders(['Referer' => $referer])
+                            ->timeout(30)
+                            ->get('https://www.googleapis.com/youtube/v3/playlistItems', $pParams);
                     } else {
-                        $reqs[] = $pool->as($chId)->withToken($token)->timeout(10)->get('https://www.googleapis.com/youtube/v3/playlistItems', $pParams);
+                        $reqs[] = $pool->as($chId)
+                            ->withToken($token)
+                            ->withHeaders(['Referer' => $referer])
+                            ->timeout(30)
+                            ->get('https://www.googleapis.com/youtube/v3/playlistItems', $pParams);
                     }
                 }
                 return $reqs;
             });
 
-            // 並列リクエストのレスポンスを順次処理
             foreach ($responses as $chId => $response) {
                 if ($response instanceof \Illuminate\Http\Client\Response && $response->successful()) {
                     $pData = $response->json();
